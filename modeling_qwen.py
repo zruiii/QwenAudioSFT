@@ -8,7 +8,7 @@ import importlib
 import math
 import shutil
 import pathlib
-from typing import TYPE_CHECKING, Optional, Tuple, Union, Callable, List, Any, Generator, Dict, Iterable
+from typing import TYPE_CHECKING, Optional, Tuple, Union, Callable, List, Any, Generator, Dict
 import os
 
 import torch
@@ -20,7 +20,6 @@ from torch.cuda.amp import autocast
 from torch.nn import CrossEntropyLoss
 from transformers import PreTrainedTokenizer, GenerationConfig, StoppingCriteriaList
 from transformers.generation.logits_process import LogitsProcessorList
-from transformers.generation import LogitsProcessor
 
 if TYPE_CHECKING:
     from transformers.generation.streamers import BaseStreamer
@@ -44,15 +43,20 @@ SUPPORT_FP16 = SUPPORT_CUDA and torch.cuda.get_device_capability(0)[0] >= 7
 SUPPORT_TORCH2 = hasattr(torch, '__version__') and int(torch.__version__.split(".")[0]) >= 2
 
 
+from .configuration_qwen import QWenConfig
 from .qwen_generation_utils import (
+    HistoryType,
+    make_context,
+    decode_tokens,
     get_stop_words_ids,
     StopWordsLogitsProcessor,
 )
-from .vae import Encoder
+from .audio import AudioEncoder
 
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "qwen"
+_CONFIG_FOR_DOC = "QWenConfig"
 
 QWen_PRETRAINED_MODEL_ARCHIVE_LIST = ["qwen-7b"]
 
@@ -140,87 +144,6 @@ def dequantize_cache_torch(qdata, scale, zero):
     data = scale * (qdata - zero)
     return data
 
-class StopWordsLogitsProcessor(LogitsProcessor):
-    """
-    :class:`transformers.LogitsProcessor` that enforces that when specified sequences appear, stop geration.
-    Args:
-        stop_words_ids (:obj:`List[List[int]]`):
-            List of list of token ids of stop ids. In order to get the tokens of the words
-            that should not appear in the generated text, use :obj:`tokenizer(bad_word,
-            add_prefix_space=True).input_ids`.
-        eos_token_id (:obj:`int`):
-            The id of the `end-of-sequence` token.
-    """
-
-    def __init__(self, stop_words_ids: Iterable[Iterable[int]], eos_token_id: int):
-
-        if not isinstance(stop_words_ids, List) or len(stop_words_ids) == 0:
-            raise ValueError(
-                f"`stop_words_ids` has to be a non-emtpy list, but is {stop_words_ids}."
-            )
-        if any(not isinstance(bad_word_ids, list) for bad_word_ids in stop_words_ids):
-            raise ValueError(
-                f"`stop_words_ids` has to be a list of lists, but is {stop_words_ids}."
-            )
-        if any(
-            any(
-                (not isinstance(token_id, (int, np.integer)) or token_id < 0)
-                for token_id in stop_word_ids
-            )
-            for stop_word_ids in stop_words_ids
-        ):
-            raise ValueError(
-                f"Each list in `stop_words_ids` has to be a list of positive integers, but is {stop_words_ids}."
-            )
-
-        self.stop_words_ids = list(
-            filter(
-                lambda bad_token_seq: bad_token_seq != [eos_token_id], stop_words_ids
-            )
-        )
-        self.eos_token_id = eos_token_id
-        for stop_token_seq in self.stop_words_ids:
-            assert (
-                len(stop_token_seq) > 0
-            ), "Stop words token sequences {} cannot have an empty list".format(
-                stop_words_ids
-            )
-
-    def __call__(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
-    ) -> torch.FloatTensor:
-        stopped_samples = self._calc_stopped_samples(input_ids)
-        for i, should_stop in enumerate(stopped_samples):
-            if should_stop:
-                scores[i, self.eos_token_id] = float(2**15)
-        return scores
-
-    def _tokens_match(self, prev_tokens: torch.LongTensor, tokens: List[int]) -> bool:
-        if len(tokens) == 0:
-            # if bad word tokens is just one token always ban it
-            return True
-        elif len(tokens) > len(prev_tokens):
-            # if bad word tokens are longer then prev input_ids they can't be equal
-            return False
-        elif prev_tokens[-len(tokens) :].tolist() == tokens:
-            # if tokens match
-            return True
-        else:
-            return False
-
-    def _calc_stopped_samples(self, prev_input_ids: Iterable[int]) -> Iterable[int]:
-        stopped_samples = []
-        for prev_input_ids_slice in prev_input_ids:
-            match = False
-            for stop_token_seq in self.stop_words_ids:
-                if self._tokens_match(prev_input_ids_slice, stop_token_seq):
-                    # if tokens do not match continue
-                    match = True
-                    break
-            stopped_samples.append(match)
-
-        return stopped_samples
-        
 class FlashSelfAttention(torch.nn.Module):
     def __init__(
         self,
@@ -716,6 +639,7 @@ class QWenBlock(nn.Module):
 
 
 class QWenPreTrainedModel(PreTrainedModel):
+    config_class = QWenConfig
     base_model_prefix = "transformer"
     is_parallelizable = False
     supports_gradient_checkpointing = True
@@ -819,7 +743,6 @@ class QWenModel(QWenPreTrainedModel):
         ntk_alpha = max(ntk_alpha, 1)
         return ntk_alpha
 
-    # 改这里
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -848,7 +771,7 @@ class QWenModel(QWenPreTrainedModel):
                 audios = audio_info["input_audios"]
                 audio_span_tokens = audio_info["audio_span_tokens"]
                 input_audio_lengths = audio_info["input_audio_lengths"]
-                audios = self.audio.encode(audios, input_audio_lengths, audio_span_tokens)           # -> VAE.encoder
+                audios = self.audio.encode(audios,input_audio_lengths, audio_span_tokens)
             else:
                 audios = torch.concat([_["input_audios"] for _ in audio_info])
                 input_audio_lengths = torch.concat([_["input_audio_lengths"] for _ in audio_info])
@@ -905,7 +828,6 @@ class QWenModel(QWenPreTrainedModel):
                 past_length = past_key_values[0][0][0].size(2)
             else:
                 past_length = past_key_values[0][0].size(-2)
-                
         if position_ids is None:
             position_ids = torch.arange(
                 past_length,
@@ -1249,6 +1171,137 @@ class QWenLMHeadModel(QWenPreTrainedModel):
             for layer_past in past_key_values
         )
 
+    def chat(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        query: str,
+        history: Optional[HistoryType],
+        system: str = "You are a helpful assistant.",
+        append_history: bool = True,
+        stream: Optional[bool] = _SENTINEL,
+        stop_words_ids: Optional[List[List[int]]] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        **kwargs,
+    ) -> Tuple[str, HistoryType]:
+        generation_config = generation_config if generation_config is not None else self.generation_config
+
+        assert stream is _SENTINEL, _ERROR_STREAM_IN_CHAT
+        assert generation_config.chat_format == 'chatml', _ERROR_BAD_CHAT_FORMAT
+        if history is None:
+            history = []
+        else:
+            # make a copy of the user's input such that is is left untouched
+            history = copy.deepcopy(history)
+
+        if stop_words_ids is None:
+            stop_words_ids = []
+
+        max_window_size = kwargs.get('max_window_size', None)
+        if max_window_size is None:
+            max_window_size = generation_config.max_window_size
+        raw_text, context_tokens, audio_info = make_context(
+            tokenizer,
+            query,
+            history=history,
+            system=system,
+            max_window_size=max_window_size,
+            chat_format=generation_config.chat_format,
+        )
+
+        stop_words_ids.extend(get_stop_words_ids(
+            generation_config.chat_format, tokenizer
+        ))
+        input_ids = torch.tensor([context_tokens]).to(self.device)
+        kwargs['audio_info'] = audio_info
+        outputs = self.generate(
+                    input_ids,
+                    stop_words_ids=stop_words_ids,
+                    return_dict_in_generate=False,
+                    generation_config=generation_config,
+                    **kwargs,
+                )
+
+        response = decode_tokens(
+            outputs[0],
+            tokenizer,
+            raw_text_len=len(raw_text),
+            context_length=len(context_tokens),
+            chat_format=generation_config.chat_format,
+            verbose=False,
+            errors='replace',
+            audio_info=audio_info
+        )
+
+        # as history is a copy of the user inputs,
+        # we can always return the new turn to the user.
+        # separating input history and output history also enables the user
+        # to implement more complex history management
+        history.append((query, response))
+
+        return response, history
+
+    def chat_stream(
+            self,
+            tokenizer: PreTrainedTokenizer,
+            query: str,
+            history: Optional[HistoryType],
+            system: str = "You are a helpful assistant.",
+            stop_words_ids: Optional[List[List[int]]] = None,
+            logits_processor: Optional[LogitsProcessorList] = None,
+            generation_config: Optional[GenerationConfig] = None,
+            **kwargs,
+    ) -> Generator[str, Any, None]:
+        generation_config = generation_config if generation_config is not None else self.generation_config
+        assert generation_config.chat_format == 'chatml', _ERROR_BAD_CHAT_FORMAT
+        if history is None:
+            history = []
+        if stop_words_ids is None:
+            stop_words_ids = []
+
+        max_window_size = kwargs.get('max_window_size', None)
+        if max_window_size is None:
+            max_window_size = generation_config.max_window_size
+        raw_text, context_tokens = make_context(
+            tokenizer,
+            query,
+            history=history,
+            system=system,
+            max_window_size=max_window_size,
+            chat_format=generation_config.chat_format,
+        )
+
+        stop_words_ids.extend(get_stop_words_ids(
+            generation_config.chat_format, tokenizer
+        ))
+        if stop_words_ids is not None:
+            stop_words_logits_processor = StopWordsLogitsProcessor(
+                stop_words_ids=stop_words_ids,
+                eos_token_id=generation_config.eos_token_id,
+            )
+            if logits_processor is None:
+                logits_processor = LogitsProcessorList([stop_words_logits_processor])
+            else:
+                logits_processor.append(stop_words_logits_processor)
+        input_ids = torch.tensor([context_tokens]).to(self.device)
+
+        from transformers_stream_generator.main import NewGenerationMixin, StreamGenerationConfig
+        self.__class__.generate_stream = NewGenerationMixin.generate
+        self.__class__.sample_stream = NewGenerationMixin.sample_stream
+        stream_config = StreamGenerationConfig(**generation_config.to_dict(), do_stream=True)
+
+        def stream_generator():
+            outputs = []
+            for token in self.generate_stream(
+                    input_ids,
+                    return_dict_in_generate=False,
+                    generation_config=stream_config,
+                    logits_processor=logits_processor,
+                    seed=-1,
+                    **kwargs):
+                outputs.append(token.item())
+                yield tokenizer.decode(outputs, skip_special_tokens=True, errors='ignore')
+
+        return stream_generator()
 
     def generate(
         self,
